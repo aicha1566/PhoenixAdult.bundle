@@ -1,70 +1,59 @@
 import PAsearchSites
 import PAgenres
 import PAactors
-import json
-import re
+import PAutils
 
 
-def bypassCloudflare(url, headers=''):
-    params = json.dumps({'id':0,'json':json.dumps({'method':'GET','url':url,'headers':headers,'idnUrl':url}),'deviceId':'','sessionId':''})
-    req = urllib.Request('https://api.reqbin.com/api/v1/requests', params, headers={
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'
-    })
-    data = urllib.urlopen(req).read()
+def getToken(url):
+    req = PAutils.HTTPRequest(url)
 
-    return json.loads(data)['Content']
+    if req:
+        return re.search(r'\.access_token=\"(.*?)\"', req.text).group(1)
+    return None
 
 
-def getDatafromAPI(baseURL, sceneId):
-    data = bypassCloudflare(baseURL)
-    token = re.search(r'\.access_token=\"(.*?)\"', data).group(1)
+def getDatafromAPI(baseURL, searchData, token, search=True):
+    data = {}
+    headers = {'Authorization': 'Bearer ' + token}
 
-    url = baseURL + '/api/movies/' + str(sceneId)
-    headers = 'Authorization: Bearer ' + token
+    if search:
+        headers['Content-Type'] = 'application/json'
+        params = json.dumps({'query': searchData})
+        req = PAutils.HTTPRequest(baseURL, headers=headers, params=params)
+    else:
+        url = baseURL + '/api/movies/slug/' + str(searchData)
+        headers = {'Authorization': 'Bearer ' + token}
+        req = PAutils.HTTPRequest(url, headers=headers)
 
-    return bypassCloudflare(url, headers)
+    if req:
+        data = req.json()
+        if 'data' in data:
+            return data['data']
+    return data
 
 
-def search(results,encodedTitle,title,searchTitle,siteNum,lang,searchByDateActor,searchDate,searchSiteID):
-    if searchSiteID != 9999:
-        siteNum = searchSiteID
+def search(results, encodedTitle, searchTitle, siteNum, lang, searchDate):
+    token = getToken(PAsearchSites.getSearchBaseURL(siteNum))
+    if token:
+        searchResults = getDatafromAPI(PAsearchSites.getSearchSearchURL(siteNum), searchTitle, token)
+        for searchResult in searchResults:
+            if searchResult['resourceType'] == 'confessions':
+                curID = searchResult['slug']
+                titleNoFormatting = searchResult['title']
 
-    url = PAsearchSites.getSearchSearchURL(siteNum) + '?&x-algolia-application-id=2RZI1CNTO2&x-algolia-api-key=797e0814d00bb34f8bcb08e575e26625'
-    params = json.dumps({'requests':[{'indexName':'production_movies','params':'query=' + searchTitle}]})
-    req = urllib.Request(url)
-    req.add_header('Content-Type', 'application/json')
-    data = urllib.urlopen(req, params).read()
+                score = 100 - Util.LevenshteinDistance(searchTitle.lower(), titleNoFormatting.lower())
 
-    searchResults = json.loads(data)['results'][0]['hits']
-    for idx, searchResult in enumerate(searchResults):
-        curID = searchResult['id']
-        titleNoFormatting = searchResult['title']['def']
-        releaseDate = parse(searchResult['release_date']['def']).strftime('%Y-%m-%d')
-        if searchDate:
-            score = 100 - Util.LevenshteinDistance(searchDate, releaseDate)
-        else:
-            score = 100 - Util.LevenshteinDistance(searchTitle.lower(), titleNoFormatting.lower())
-
-        data = getDatafromAPI(PAsearchSites.getSearchBaseURL(siteNum), curID)
-        if 'error' not in data:
-            results.Append(MetadataSearchResult(id='%d|%d' % (curID, siteNum), name='%s %s' % (titleNoFormatting, releaseDate), score=score, lang=lang))
+                results.Append(MetadataSearchResult(id='%s|%d' % (curID, siteNum), name='%s' % (titleNoFormatting), score=score, lang=lang))
 
     return results
 
 
-def update(metadata,siteID,movieGenres,movieActors):
-    Log('******UPDATE CALLED*******')
-
+def update(metadata, siteID, movieGenres, movieActors):
     metadata_id = str(metadata.id).split('|')
-    sceneId = metadata_id[0]
+    sceneID = metadata_id[0]
 
-    data = getDatafromAPI(PAsearchSites.getSearchBaseURL(siteID), sceneId)
-    detailsPageElements = json.loads(data)['data']
-
-    # Studio
-    producerLink = detailsPageElements['producer']
-    metadata.studio = '%s %s' % (producerLink['name'], producerLink['last_name'])
+    token = getToken(PAsearchSites.getSearchBaseURL(siteID))
+    detailsPageElements = getDatafromAPI(PAsearchSites.getSearchBaseURL(siteID), sceneID, token, False)
 
     # Title
     metadata.title = detailsPageElements['title']
@@ -72,22 +61,26 @@ def update(metadata,siteID,movieGenres,movieActors):
     # Summary
     metadata.summary = detailsPageElements['synopsis_clean']
 
+    # Studio
+    producerLink = detailsPageElements['producer']
+    metadata.studio = '%s %s' % (producerLink['name'], producerLink['last_name'])
+
     # Tagline and Collection(s)
     metadata.collections.clear()
     tagline = PAsearchSites.getSearchSiteName(siteID).strip()
     metadata.tagline = tagline
     metadata.collections.add(tagline)
 
+    # Release Date
+    date_object = parse(detailsPageElements['release_date'])
+    metadata.originally_available_at = date_object
+    metadata.year = metadata.originally_available_at.year
+
     # Genres
     movieGenres.clearGenres()
     for genreLink in detailsPageElements['tags']:
         genreName = genreLink['title']
         movieGenres.addGenre(genreName)
-
-    # Release Date
-    date_object = parse(detailsPageElements['release_date'])
-    metadata.originally_available_at = date_object
-    metadata.year = metadata.originally_available_at.year
 
     # Actors
     movieActors.clearActors()
@@ -112,20 +105,20 @@ def update(metadata,siteID,movieGenres,movieActors):
 
     Log('Artwork found: %d' % len(art))
     for idx, posterUrl in enumerate(art, 1):
-        if not PAsearchSites.posterAlreadyExists(posterUrl,metadata):            
+        if not PAsearchSites.posterAlreadyExists(posterUrl, metadata):
             # Download image file for analysis
             try:
-                img_file = urllib.urlopen(posterUrl)
-                im = StringIO(img_file.read())
+                image = PAutils.HTTPRequest(posterUrl, headers={'Referer': 'http://www.google.com'})
+                im = StringIO(image.content)
                 resized_image = Image.open(im)
                 width, height = resized_image.size
                 # Add the image proxy items to the collection
                 if width > 1 or height > width:
                     # Item is a poster
-                    metadata.posters[posterUrl] = Proxy.Media(HTTP.Request(posterUrl, headers={'Referer': 'http://www.google.com'}).content, sort_order=idx)
-                if width > 100 and width > height and idx > 1:
+                    metadata.posters[posterUrl] = Proxy.Media(image.content, sort_order=idx)
+                if width > 100 and width > height:
                     # Item is an art item
-                    metadata.art[posterUrl] = Proxy.Media(HTTP.Request(posterUrl, headers={'Referer': 'http://www.google.com'}).content, sort_order=idx)
+                    metadata.art[posterUrl] = Proxy.Media(image.content, sort_order=idx)
             except:
                 pass
 
